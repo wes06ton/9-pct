@@ -1,0 +1,164 @@
+name: Deploy and Monitor VMs
+on:
+ push:
+ branches:
+ - main
+permissions:
+ id-token: write
+ contents: read
+jobs:
+ deploy:
+ runs-on: ubuntu-latest
+ 
+ steps:
+ - name: Checkout Repository
+ uses: actions/checkout@v4
+ - name: Setup Terraform
+ uses: hashicorp/setup-terraform@v3
+ - name: Generate SSH Key Pair
+ run: |
+ mkdir -p ~/.ssh
+ ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
+ SSH_PUBLIC_KEY=$(cat ~/.ssh/id_rsa.pub)
+ echo "TF_VAR_ssh_public_key=${SSH_PUBLIC_KEY}" >> "$GITHUB_ENV"
+ - name: Azure Login
+ uses: azure/login@v2
+ with:
+ creds: ${{ secrets.AZURE_CREDENTIALS }}
+ - name: Check and Create Terraform Backend Resources
+ run: |
+ # Check if resource group exists
+ RG_EXISTS=$(az group exists --name "tfstate-rg")
+ 
+ if [ "$RG_EXISTS" = "false" ]; then
+ echo "Creating resource group tfstate-rg..."
+ az group create --name tfstate-rg --location "East US"
+ else
+ echo "Resource group tfstate-rg already exists."
+ fi
+ 
+ # Check if storage account exists
+ EXISTING_STORAGE=$(az storage account list --resource-group tfstate-rg --query 
+"[?starts_with(name, 'tfstate')].name" -o tsv | head -n 1)
+ 
+ if [ -n "$EXISTING_STORAGE" ]; then
+ echo "Using existing storage account: $EXISTING_STORAGE"
+ STORAGE_ACCOUNT=$EXISTING_STORAGE
+ else
+ RANDOM_ID=$(date +%s)
+ STORAGE_ACCOUNT="tfstate${RANDOM_ID}"
+ echo "Creating new storage account: $STORAGE_ACCOUNT"
+ az storage account create --name $STORAGE_ACCOUNT --resource-group tfstaterg --location "East US" --sku Standard_LRS --encryption-services blob
+ fi
+ 
+ # Check if container exists
+ CONTAINER_EXISTS=$(az storage container exists --name tfstate --account-name 
+$STORAGE_ACCOUNT --auth-mode login --query "exists" -o tsv || echo "false")
+ 
+ if [ "$CONTAINER_EXISTS" = "false" ]; then
+ echo "Creating storage container..."
+ az storage container create --name tfstate --account-name $STORAGE_ACCOUNT 
+--auth-mode login
+ else
+ echo "Storage container already exists."
+ fi
+ 
+ # Save storage account name for later steps
+ echo "STORAGE_ACCOUNT=$STORAGE_ACCOUNT" >> $GITHUB_ENV
+ - name: Terraform Init
+ working-directory: ./terraform
+ run: |
+ # Extract credentials from AZURE_CREDENTIALS
+ SUBSCRIPTION_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r 
+.subscriptionId)
+ TENANT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .tenantId)
+ CLIENT_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientId)
+ CLIENT_SECRET=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r .clientSecret)
+ 
+ terraform init \
+ -backend-config="resource_group_name=tfstate-rg" \
+ -backend-config="storage_account_name=${{ env.STORAGE_ACCOUNT }}" \
+ -backend-config="container_name=tfstate" \
+ -backend-config="key=terraform.tfstate" \
+ -backend-config="subscription_id=${SUBSCRIPTION_ID}" \
+ -backend-config="tenant_id=${TENANT_ID}" \
+ -backend-config="client_id=${CLIENT_ID}" \
+ -backend-config="client_secret=${CLIENT_SECRET}"
+ - name: Terraform Plan
+ working-directory: ./terraform
+ run: terraform plan -out=tfplan
+ env:
+ TF_VAR_subscription_id: ${{
+fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+ TF_VAR_client_id: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+ TF_VAR_client_secret: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+ TF_VAR_tenant_id: ${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}
+ - name: Terraform Apply
+ working-directory: ./terraform
+ if: github.ref == 'refs/heads/main'
+ run: terraform apply -auto-approve tfplan
+ - name: Display VM Access Information
+ if: success()
+ working-directory: ./terraform
+ run: |
+ echo "=== VM Access Information ===" >> $GITHUB_STEP_SUMMARY
+ echo "| VM | IP Address | Grafana URL | Prometheus URL |" >>
+$GITHUB_STEP_SUMMARY
+ echo "|----|-----------:|-------------|----------------|" >> $GITHUB_STEP_SUMMARY
+ terraform output -json vm_access_details | jq -r '. | to_entries[] | "| \(.key) | 
+\(.value.public_ip) | [\(.value.grafana_url)](\(.value.grafana_url)) | 
+[\(.value.prometheus_url)](\(.value.prometheus_url)) |"' >> $GITHUB_STEP_SUMMARY
+ echo "" >> $GITHUB_STEP_SUMMARY
+ echo "Grafana Default Credentials:" >> $GITHUB_STEP_SUMMARY
+ echo "- Username: admin" >> $GITHUB_STEP_SUMMARY
+ echo "- Password: admin (change on first login)" >> $GITHUB_STEP_SUMMARY
+ - name: Test SSH Connection
+ if: success()
+ working-directory: ./terraform
+ run: |
+ chmod 600 ~/.ssh/id_rsa
+ echo "Waiting for 60 seconds for VM initialization..."
+ sleep 60
+ 
+ # Function to test SSH connection with retries
+ test_ssh_connection() {
+ local ip=$1
+ local max_attempts=10
+ local attempt=1
+ local wait_time=30
+ 
+ while [ $attempt -le $max_attempts ]; do
+ echo "Attempt $attempt of $max_attempts: Testing SSH connection to $ip..."
+ if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/id_rsa 
+adminuser@$ip "hostname"; then
+ echo "Successfully connected to $ip"
+ return 0
+ fi
+ 
+ echo "Connection failed. Waiting $wait_time seconds before retry..."
+ sleep $wait_time
+ attempt=$((attempt + 1))
+ done
+ 
+ echo "Failed to connect to $ip after $max_attempts attempts"
+ return 1
+ }
+ 
+ # Get the public IPs
+ echo "Getting VM public IPs..."
+ PUBLIC_IPS=$(terraform output -json vm_public_ips | jq -r '.[]')
+ 
+ if [ -z "$PUBLIC_IPS" ]; then
+ echo "Error: No public IPs found in terraform output"
+ exit 1
+ fi
+ 
+ # Test connection to each IP
+ failed=0
+ for IP in $PUBLIC_IPS; do
+ if ! test_ssh_connection "$IP"; then
+ failed=1
+ fi
+ done
+ 
+ exit $failed
